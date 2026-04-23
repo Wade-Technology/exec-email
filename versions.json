@@ -1,0 +1,7 @@
+{
+  "exec-email": {
+    "version": "1.0.0",
+    "updated": "2026-04-22",
+    "description": "Initial release: 8 AI exec mailboxes via IMAP IDLE + SMTP, routed through Aspen Crew permanent-message API"
+  }
+}

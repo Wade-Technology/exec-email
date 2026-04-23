@@ -1,0 +1,37 @@
+services:
+  exec-email:
+    build: .
+    container_name: exec-email
+    restart: unless-stopped
+    # Join the wtec network so we can reach aspen-admin-backend and the shared postgres
+    networks:
+      - wtec_default
+    ports:
+      - "127.0.0.1:8085:8080"   # /healthz exposed locally for MC poller
+    environment:
+      - ASPEN_ADMIN_URL=${ASPEN_ADMIN_URL:-http://aspen-admin-backend:8001}
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
+      - WADE_BCC_EMAIL=${WADE_BCC_EMAIL:-${WADE_EMAIL:-wadethomaswarren@gmail.com}}
+      - IMAP_HOST=${IMAP_HOST:-imap.migadu.com}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - SMTP_HOST=${SMTP_HOST:-smtp.migadu.com}
+      - SMTP_PORT=${SMTP_PORT:-465}
+      - POLL_INTERVAL_FALLBACK=${POLL_INTERVAL_FALLBACK:-30}
+      - MAX_THREAD_TURNS=${MAX_THREAD_TURNS:-3}
+      - DB_HOST=${DB_HOST:-wtec-postgres}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_USER=${DB_USER:-wtec}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME:-wtec}
+      - EXEC_EMAIL_CEO_PASSWORD=${EXEC_EMAIL_CEO_PASSWORD:-}
+      - EXEC_EMAIL_CTO_PASSWORD=${EXEC_EMAIL_CTO_PASSWORD:-}
+      - EXEC_EMAIL_COO_PASSWORD=${EXEC_EMAIL_COO_PASSWORD:-}
+      - EXEC_EMAIL_CSO_PASSWORD=${EXEC_EMAIL_CSO_PASSWORD:-}
+      - EXEC_EMAIL_CFO_PASSWORD=${EXEC_EMAIL_CFO_PASSWORD:-}
+      - EXEC_EMAIL_CRO_PASSWORD=${EXEC_EMAIL_CRO_PASSWORD:-}
+      - EXEC_EMAIL_CCIO_PASSWORD=${EXEC_EMAIL_CCIO_PASSWORD:-}
+      - EXEC_EMAIL_HIGGINSDEV_PASSWORD=${EXEC_EMAIL_HIGGINSDEV_PASSWORD:-}
+
+networks:
+  wtec_default:
+    external: true

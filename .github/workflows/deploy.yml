@@ -1,0 +1,43 @@
+name: Deploy to Hetzner
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-exec-email
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: SSH and deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: 22
+          command_timeout: 12m
+          script: |
+            set -e
+            if [ ! -d /opt/exec-email ]; then
+              git clone https://github.com/Wade-Technology/exec-email.git /opt/exec-email
+            fi
+            cd /opt/exec-email
+            git fetch origin main
+            git reset --hard origin/main
+            # Source /opt/wtec/.env so the Migadu mailbox passwords are available to compose
+            if [ -f /opt/wtec/.env ]; then
+              set -a; . /opt/wtec/.env; set +a
+            fi
+            docker compose up -d --build
+            sleep 5
+            STATUS=$(docker ps --filter "name=^exec-email$" --format '{{.Status}}')
+            echo "$STATUS"
+            echo "$STATUS" | grep -q "Up" || { docker logs exec-email --tail 80; exit 1; }
+            # Hit healthz to verify
+            curl -fsS http://127.0.0.1:8085/healthz > /tmp/exec-email-health.json && head -c 400 /tmp/exec-email-health.json && echo

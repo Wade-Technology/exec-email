@@ -1,0 +1,4 @@
+aioimaplib==1.0.1
+aiosmtplib==3.0.2
+aiohttp==3.9.5
+asyncpg==0.29.0
