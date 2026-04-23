@@ -115,6 +115,30 @@ Key vars:
 | `MAX_PER_ROLE_PER_DAY` | Per-role 24h hard cap (default 50) — DoS amp prevention |
 | `POLL_INTERVAL_FALLBACK` | Seconds between IDLE keepalives (default 30) |
 | `DB_*` | Reuses the wtec Postgres for thread state + rate-limit ledger |
+| `NESTA_DB_*` | Optional. Enables a fire-and-forget double-log of every inbound/outbound to nesta's `conversations` table so MC /communications surfaces exec traffic alongside Nesta mail. Exec-email keeps running normally if this DB is unreachable. |
+| `WADE_TENANT_ID` | UUID used as `tenant_id` on Nesta conversations rows (default: Wade's tenant). |
+
+## Unified logging to Nesta `conversations`
+
+When `NESTA_DB_*` is configured, every inbound and outbound message is ALSO
+written to nesta-money's `conversations` table (in addition to the
+`exec_email_threads` state exec-email owns). This gives Mission Control
+`/communications` a single view of every email across Nesta + the Execs.
+
+- **Fire-and-forget:** a Nesta DB outage never blocks or crashes the IMAP loop.
+  Failures are logged and counted on `/healthz` under `nesta_log`.
+- **Additive:** the Nesta row is a log copy. The `exec_email_threads` schema
+  remains authoritative for exec-email's own operation.
+- **Tenant scoping:** all exec rows land under `WADE_TENANT_ID`
+  (Exec Team is Wade-scoped admin).
+- **Direction + visibility:**
+  - Inbound parsed OK → `direction='inbound'`, `visibility_tag='system'`
+  - Outbound sent OK → `direction='outbound'`, `visibility_tag='system'`
+  - Outbound SMTP failure → `direction='outbound'`, `visibility_tag='sensitive'`,
+    `requires_review=true` so Wade sees failed sends
+- **persona_id:** the exec role key (`ceo`, `coo`, `cto`, etc.)
+- **metadata:** JSONB carrying `from`, `to`, `cc`, `message_id`, `in_reply_to`,
+  `thread_root_id`, `exec_role`, `exec_name` (and `smtp_error` / `handoff` when applicable).
 
 ## Deploy
 

@@ -3,9 +3,13 @@ services:
     build: .
     container_name: exec-email
     restart: unless-stopped
-    # Join the shared wade-network so we can reach aspen-admin-backend and the shared postgres
+    # Join the shared wade-network so we can reach aspen-admin-backend and the shared postgres.
+    # ALSO join nesta-money's internal net so we can double-log inbound/outbound
+    # to the nesta `conversations` table for unified MC /communications visibility.
+    # nesta-money-postgres is NOT on wade-network, so the second attachment is required.
     networks:
       - wade-network
+      - nesta-money-net
     ports:
       - "127.0.0.1:8085:8080"   # /healthz exposed locally for MC poller
     environment:
@@ -25,6 +29,14 @@ services:
       - DB_USER=${DB_USER:-wtec}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME:-wtec}
+      # Nesta conversations double-log (fire-and-forget; exec_email_threads is authoritative).
+      # NESTA_DB_HOST is reachable via the nesta-money-net external attachment below.
+      - NESTA_DB_HOST=${NESTA_DB_HOST:-nesta-money-postgres}
+      - NESTA_DB_PORT=${NESTA_DB_PORT:-5432}
+      - NESTA_DB_USER=${NESTA_DB_USER:-app_user}
+      - NESTA_DB_PASSWORD=${NESTA_DB_PASSWORD}
+      - NESTA_DB_NAME=${NESTA_DB_NAME:-teller}
+      - WADE_TENANT_ID=${WADE_TENANT_ID:-fe0f026f-1bff-497e-b623-3c303cd00699}
       - EXEC_EMAIL_CEO_PASSWORD=${EXEC_EMAIL_CEO_PASSWORD:-}
       - EXEC_EMAIL_CTO_PASSWORD=${EXEC_EMAIL_CTO_PASSWORD:-}
       - EXEC_EMAIL_COO_PASSWORD=${EXEC_EMAIL_COO_PASSWORD:-}
@@ -37,3 +49,9 @@ services:
 networks:
   wade-network:
     external: true
+  # The nesta-money stack owns this net at /root/nesta-money/docker-compose.yml.
+  # We attach as an external network so we can reach nesta-money-postgres
+  # (which lives on this network and is NOT on wade-network).
+  nesta-money-net:
+    external: true
+    name: nesta-money_nesta-money-net

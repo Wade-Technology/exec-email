@@ -24,6 +24,7 @@ import os
 import re
 import signal
 import ssl
+import uuid
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import getaddresses, parseaddr
@@ -82,6 +83,42 @@ DB_DSN = (
     f"{os.environ.get('DB_PORT','5432')}"
     f"/{os.environ.get('DB_NAME','wtec')}"
 )
+
+# ───── Nesta conversations double-log ───────────────────────────────────
+# Every inbound + outbound also gets logged to nesta's `conversations`
+# table so MC /communications shows Exec traffic alongside Nesta mail.
+# This is ADDITIVE — the exec_email_threads schema above is still
+# authoritative. Nesta DB hiccups must NOT block the IMAP loop.
+#
+# All Exec rows live under Wade's tenant_id (Exec Team is Wade-scoped).
+WADE_TENANT_ID = os.environ.get(
+    "WADE_TENANT_ID", "fe0f026f-1bff-497e-b623-3c303cd00699"
+).strip()
+
+NESTA_DB_HOST = os.environ.get("NESTA_DB_HOST", "").strip()
+NESTA_DB_PORT = os.environ.get("NESTA_DB_PORT", "5432").strip()
+NESTA_DB_USER = os.environ.get("NESTA_DB_USER", "").strip()
+NESTA_DB_PASSWORD = os.environ.get("NESTA_DB_PASSWORD", "")
+NESTA_DB_NAME = os.environ.get("NESTA_DB_NAME", "").strip()
+
+NESTA_DB_DSN: Optional[str] = None
+if NESTA_DB_HOST and NESTA_DB_USER and NESTA_DB_NAME:
+    NESTA_DB_DSN = (
+        f"postgres://{NESTA_DB_USER}:{NESTA_DB_PASSWORD}"
+        f"@{NESTA_DB_HOST}:{NESTA_DB_PORT}/{NESTA_DB_NAME}"
+    )
+
+# Pool is optional — if init fails we just never log to Nesta.
+nesta_db_pool: Optional[asyncpg.Pool] = None
+# Track state so healthz / logs can reflect whether the bridge is live.
+_nesta_log_state = {
+    "configured": bool(NESTA_DB_DSN),
+    "connected": False,
+    "last_error": None,
+    "last_logged_at": None,
+    "rows_logged": 0,
+    "failures": 0,
+}
 
 DOMAIN = "wade.technology"
 
@@ -326,6 +363,123 @@ async def save_thread(role: str, thread_id: str, message_id: str, prior_messages
             )
     except Exception as e:
         logger.warning(f"[{role}] save_thread DB error — degrading: {e!r}")
+
+
+# ───── Nesta conversations bridge ────────────────────────────────────────
+async def init_nesta_db() -> None:
+    """Open an async pool to nesta_money DB for the conversations
+    double-log. Never raises — if Nesta is unreachable the bridge stays
+    disabled and the main loop proceeds. (Caller must still await this.)
+    """
+    global nesta_db_pool
+    if not NESTA_DB_DSN:
+        logger.info("[nesta-log] NESTA_DB_* not set — unified logging disabled")
+        return
+    try:
+        nesta_db_pool = await asyncpg.create_pool(
+            dsn=NESTA_DB_DSN,
+            min_size=1,
+            max_size=3,
+            timeout=10,
+            command_timeout=5,
+        )
+        # Verify the conversations table is reachable; a misconfigured
+        # DSN should surface at startup, not on the first email.
+        async with nesta_db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1 FROM conversations LIMIT 1")
+        _nesta_log_state["connected"] = True
+        _nesta_log_state["last_error"] = None
+        logger.info(
+            f"[nesta-log] connected to {NESTA_DB_HOST}:{NESTA_DB_PORT}/"
+            f"{NESTA_DB_NAME} — double-log active"
+        )
+    except Exception as e:
+        _nesta_log_state["connected"] = False
+        _nesta_log_state["last_error"] = _scrub(str(e))
+        logger.warning(
+            f"[nesta-log] init failed (double-log disabled): {_scrub(repr(e))}"
+        )
+        # Leak the half-open pool if one was created; fire-and-forget
+        # is fine, we never use it.
+        nesta_db_pool = None
+
+
+async def _insert_nesta_conversation(
+    direction: str,
+    mailbox: str,
+    persona_id: str,
+    subject: str,
+    body: str,
+    body_plain: str,
+    metadata: dict,
+    trigger_event: str,
+    initiated_by: str,
+    visibility_tag: str = "system",
+    ai_confidence: Optional[float] = None,
+    requires_review: bool = False,
+) -> None:
+    """Insert one row into nesta conversations. Fire-and-forget —
+    any exception is swallowed so the IMAP loop never blocks on Nesta.
+    """
+    if nesta_db_pool is None:
+        return
+    try:
+        async with nesta_db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO conversations (
+                    id, tenant_id, channel, direction, mailbox, persona_id,
+                    subject, body, body_plain, metadata, ai_confidence,
+                    visibility_tag, trigger_event, initiated_by, requires_review
+                ) VALUES (
+                    $1, $2::uuid, 'email', $3, $4, $5,
+                    $6, $7, $8, $9::jsonb, $10,
+                    $11, $12, $13, $14
+                )
+                """,
+                uuid.uuid4(),
+                WADE_TENANT_ID,
+                direction,
+                mailbox,
+                persona_id,
+                (subject or "")[:500],
+                body or "",
+                body_plain or "",
+                json.dumps(metadata or {}),
+                ai_confidence,
+                visibility_tag,
+                trigger_event,
+                initiated_by,
+                requires_review,
+            )
+        _nesta_log_state["rows_logged"] += 1
+        _nesta_log_state["last_logged_at"] = now_iso()
+        _nesta_log_state["connected"] = True
+        _nesta_log_state["last_error"] = None
+    except Exception as e:
+        _nesta_log_state["failures"] += 1
+        _nesta_log_state["last_error"] = _scrub(str(e))
+        _nesta_log_state["connected"] = False
+        logger.warning(
+            f"[nesta-log] insert failed ({direction} {mailbox}): "
+            f"{_scrub(repr(e))}"
+        )
+
+
+def _log_to_nesta_fire_and_forget(**kwargs) -> None:
+    """Schedule a conversations insert without awaiting it. Any failure
+    is swallowed by _insert_nesta_conversation's try/except. The
+    resulting task is named so it shows up in diagnostics."""
+    if nesta_db_pool is None:
+        return
+    try:
+        asyncio.create_task(
+            _insert_nesta_conversation(**kwargs),
+            name=f"nesta-log-{kwargs.get('direction','?')}",
+        )
+    except Exception as e:
+        # create_task can raise if the loop is closing — never fatal.
+        logger.warning(f"[nesta-log] schedule failed: {_scrub(repr(e))}")
 
 
 # ───── rate limits (H1) ──────────────────────────────────────────────────
@@ -585,6 +739,40 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> str:
         logger.info(f"[{role}] skip: empty body from {_scrub(sender_addr)}")
         return PROC_SKIP_SEEN
 
+    # Parse headers once, for both exec_email's own state + the Nesta log.
+    to_addrs = [a for _, a in getaddresses(msg.get_all("To", []) or []) if a]
+    cc_addrs = [a for _, a in getaddresses(msg.get_all("Cc", []) or []) if a]
+    msg_id_hdr = (msg.get("Message-ID") or "").strip()
+    in_reply_to_hdr = (msg.get("In-Reply-To") or "").strip()
+    root_hdr = thread_root_id(msg)
+
+    # Fire-and-forget: log the inbound to Nesta conversations. This
+    # MUST NOT raise — _log_to_nesta_fire_and_forget swallows all
+    # errors inside the scheduled task, and is a no-op when the Nesta
+    # DB pool failed to initialise.
+    _log_to_nesta_fire_and_forget(
+        direction="inbound",
+        mailbox=exec_addr,
+        persona_id=role,
+        subject=subject,
+        body=body,
+        body_plain=body,
+        metadata={
+            "from": sender_addr,
+            "to": to_addrs,
+            "cc": cc_addrs,
+            "message_id": msg_id_hdr,
+            "thread_root_id": root_hdr,
+            "in_reply_to": in_reply_to_hdr,
+            "exec_role": role,
+            "exec_name": exec_cfg["name"],
+        },
+        trigger_event="exec_email_autonomous",
+        initiated_by=role,
+        visibility_tag="system",
+        requires_review=False,
+    )
+
     # H1: per-sender hourly + per-role daily rate limit. Atomic upsert
     # in DB. If DB is down, FAIL CLOSED — public mailbox without rate
     # limiting is a DoS amplifier.
@@ -649,10 +837,34 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> str:
             f"Thanks for the follow-up. I've passed this thread to Wade for human "
             f"follow-up — he'll be in touch directly."
         )
+        reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
         try:
-            reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
             await send_smtp(exec_cfg, sender_addr, reply_subject, handoff_text,
                             in_reply_to=msg_id or None, references=new_refs or None)
+            # Fire-and-forget: log the handoff reply as outbound.
+            _log_to_nesta_fire_and_forget(
+                direction="outbound",
+                mailbox=exec_addr,
+                persona_id=role,
+                subject=reply_subject,
+                body=handoff_text + signature(exec_cfg["name"], exec_cfg["title"]),
+                body_plain=handoff_text,
+                metadata={
+                    "from": exec_addr,
+                    "to": [sender_addr] if sender_addr else [],
+                    "cc": [],
+                    "message_id": None,
+                    "thread_root_id": root_id,
+                    "in_reply_to": msg_id or None,
+                    "exec_role": role,
+                    "exec_name": exec_cfg["name"],
+                    "handoff": True,
+                },
+                trigger_event="exec_email_autonomous",
+                initiated_by=role,
+                visibility_tag="system",
+                requires_review=False,
+            )
             await notify_wade(exec_cfg, "thread handoff to you",
                               f"Thread '{_scrub(subject)}' from {_scrub(sender_addr)} "
                               f"hit MAX_THREAD_TURNS={MAX_THREAD_TURNS}.\n"
@@ -663,6 +875,28 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> str:
             return PROC_OK
         except Exception as e:
             logger.error(f"[{role}] handoff send failed: {_scrub(str(e))}")
+            # Log the failed handoff send so Wade sees it in /communications.
+            _log_to_nesta_fire_and_forget(
+                direction="outbound",
+                mailbox=exec_addr,
+                persona_id=role,
+                subject=reply_subject,
+                body=handoff_text + signature(exec_cfg["name"], exec_cfg["title"]),
+                body_plain=handoff_text,
+                metadata={
+                    "from": exec_addr,
+                    "to": [sender_addr] if sender_addr else [],
+                    "thread_root_id": root_id,
+                    "in_reply_to": msg_id or None,
+                    "exec_role": role,
+                    "handoff": True,
+                    "smtp_error": _scrub(str(e)),
+                },
+                trigger_event="exec_email_autonomous",
+                initiated_by=role,
+                visibility_tag="sensitive",
+                requires_review=True,
+            )
             return PROC_SKIP_UNSEEN
 
     # Build prior_messages with the new inbound appended.
@@ -690,11 +924,61 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> str:
     except Exception as e:
         logger.error(f"[{role}] SMTP send failed: {_scrub(str(e))}")
         state[role]["last_error"] = f"smtp error: {_scrub(str(e))}"
+        # Log the failed outbound so Wade sees it in /communications.
+        _log_to_nesta_fire_and_forget(
+            direction="outbound",
+            mailbox=exec_addr,
+            persona_id=role,
+            subject=reply_subject,
+            body=reply + signature(exec_cfg["name"], exec_cfg["title"]),
+            body_plain=reply,
+            metadata={
+                "from": exec_addr,
+                "to": [sender_addr] if sender_addr else [],
+                "cc": [],
+                "message_id": None,
+                "thread_root_id": root_id,
+                "in_reply_to": msg_id or None,
+                "exec_role": role,
+                "exec_name": exec_cfg["name"],
+                "smtp_error": _scrub(str(e)),
+            },
+            trigger_event="exec_email_autonomous",
+            initiated_by=role,
+            visibility_tag="sensitive",
+            requires_review=True,
+        )
         await notify_wade(exec_cfg, "SMTP send failed",
                           f"To: {_scrub(sender_addr)}\nSubject: {_scrub(subject)}\n"
                           f"Error: {_scrub(str(e))}\n\nReply was:\n{_scrub(reply)}")
         # SMTP transient — leave UNSEEN so next pass retries.
         return PROC_SKIP_UNSEEN
+
+    # Success: fire-and-forget log the outbound reply.
+    _log_to_nesta_fire_and_forget(
+        direction="outbound",
+        mailbox=exec_addr,
+        persona_id=role,
+        subject=reply_subject,
+        body=reply + signature(exec_cfg["name"], exec_cfg["title"]),
+        body_plain=reply,
+        metadata={
+            "from": exec_addr,
+            "to": [sender_addr] if sender_addr else [],
+            "cc": [],
+            "message_id": None,
+            "thread_root_id": root_id,
+            "in_reply_to": msg_id or None,
+            "exec_role": role,
+            "exec_name": exec_cfg["name"],
+            "turn": thread["message_count"] + 1,
+            "max_turns": MAX_THREAD_TURNS,
+        },
+        trigger_event="exec_email_autonomous",
+        initiated_by=role,
+        visibility_tag="system",
+        requires_review=False,
+    )
 
     prior.append({"role": "user", "content": crew_input})
     prior.append({"role": "assistant", "content": reply})
@@ -868,6 +1152,14 @@ async def healthz(_request: web.Request) -> web.Response:
             "max_per_role_per_day": MAX_PER_ROLE_PER_DAY,
             "max_thread_turns": MAX_THREAD_TURNS,
         },
+        "nesta_log": {
+            "configured": _nesta_log_state["configured"],
+            "connected": _nesta_log_state["connected"],
+            "rows_logged": _nesta_log_state["rows_logged"],
+            "failures": _nesta_log_state["failures"],
+            "last_logged_at": _nesta_log_state["last_logged_at"],
+            "last_error": _nesta_log_state["last_error"],
+        },
         "execs": out,
     }
     return web.json_response(payload)
@@ -898,6 +1190,13 @@ async def main() -> None:
         await init_db()
     except Exception as e:
         logger.error(f"[db] init failed: {e!r} — service will degrade (per-thread state lost across restarts)")
+
+    # Best-effort Nesta bridge for the conversations double-log.
+    # Never blocks startup, never raises into main().
+    try:
+        await init_nesta_db()
+    except Exception as e:
+        logger.warning(f"[nesta-log] init_nesta_db unexpected failure: {e!r}")
 
     runner = await start_http()
 
@@ -933,6 +1232,11 @@ async def main() -> None:
         await runner.cleanup()
         if db_pool:
             await db_pool.close()
+        if nesta_db_pool:
+            try:
+                await nesta_db_pool.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
