@@ -54,6 +54,27 @@ POLL_INTERVAL_FALLBACK = int(os.environ.get("POLL_INTERVAL_FALLBACK", "30"))
 MAX_THREAD_TURNS = int(os.environ.get("MAX_THREAD_TURNS", "3"))
 MAX_BODY_CHARS = 8000
 
+# Abuse limits for public mailboxes. Public-internet senders means a
+# single attacker could otherwise trigger thousands of LLM calls + SMTP
+# replies + Wade BCCs. These caps + the rate-limit ledger
+# (exec_email_rate) keep us safe.
+MAX_PER_SENDER_PER_HOUR = int(os.environ.get("MAX_PER_SENDER_PER_HOUR", "5"))
+MAX_PER_ROLE_PER_DAY = int(os.environ.get("MAX_PER_ROLE_PER_DAY", "50"))
+
+# Log-scrubbing limits.
+LOG_BODY_CAP = 200
+EMAIL_RE = re.compile(r"[\w\.\-+]+@[\w\.\-]+")
+
+
+def _scrub(text: str, cap: int = LOG_BODY_CAP) -> str:
+    """Cap length and redact email addresses for log/notify output."""
+    if text is None:
+        return ""
+    s = str(text)
+    if len(s) > cap:
+        s = s[:cap] + "..."
+    return EMAIL_RE.sub("<email>", s)
+
 DB_DSN = (
     f"postgres://{os.environ.get('DB_USER','wtec')}:"
     f"{os.environ.get('DB_PASSWORD','')}"
@@ -79,7 +100,19 @@ DENY_SENDER_PATTERNS = re.compile(
     r"(mailer-daemon|mail-daemon|postmaster|no[-_.]?reply|noreply|do[-_.]?not[-_.]?reply|bounces?@|notifications?@github\.com)",
     re.IGNORECASE,
 )
-DENY_SUBJECT_PREFIXES = ("re: [exec-mail]", "auto:", "automatic reply:", "out of office:")
+# Loop-protection: prefix every outbound subject with "[Exec-Mail] ",
+# refuse anything inbound that already has it (or "Re: [Exec-Mail]").
+EXEC_MAIL_SUBJECT_TAG = "[Exec-Mail]"
+EXEC_MAIL_HEADER = "X-Exec-Mail"
+DENY_SUBJECT_PREFIXES = (
+    "[exec-mail]",
+    "re: [exec-mail]",
+    "auto:",
+    "automatic reply:",
+    "out of office:",
+)
+ALLOWED_AUTO_SUBMITTED = "no"  # RFC 3834 — anything else is a bot
+DENY_PRECEDENCE = {"bulk", "list", "junk", "auto_reply", "auto-reply"}
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -96,9 +129,19 @@ state: dict = {
         "today_date": datetime.now(timezone.utc).date().isoformat(),
         "last_error": None,
         "configured": False,
+        "rate_today": 0,
+        "rate_this_hour_total": 0,
+        "rate_capped_today": False,
     }
     for e in EXECS
 }
+
+# In-memory dedup so we notify Wade at most once per sender per day
+# when a sender trips the per-hour cap (and once per role per day for
+# the role-wide cap). Keys: f"{role}:{sender}:{YYYY-MM-DD}" /
+# f"role:{role}:{YYYY-MM-DD}". Lost on restart — that's fine, worst
+# case Wade gets one extra notify after a redeploy.
+_notified_keys: set = set()
 
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -157,19 +200,14 @@ def extract_text_body(msg: email.message.Message) -> str:
             payload = msg.get_payload(decode=True) or b""
             body = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
 
-    # Trim quoted history (anything after a typical quote marker line).
-    cut_markers = (
-        "\n-----Original Message-----",
-        "\nOn ", "On ",  # "On Mon, Apr 21, 2026 at 10:00 AM Foo wrote:" — handled below
-        "\n>",
-    )
-    # Specifically chop "On <date> ... wrote:" prefix
+    # Trim quoted history. Specifically chop "On <date> ... wrote:" prefix
+    # and the classic "-----Original Message-----" divider, then drop any
+    # ">"-prefixed quote lines.
     m = re.search(r"\n(On .+wrote:)", body)
     if m:
         body = body[: m.start()]
     if "\n-----Original Message-----" in body:
         body = body.split("\n-----Original Message-----", 1)[0]
-    # Strip quoted lines
     body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith(">"))
     body = body.strip()
     return body[:MAX_BODY_CHARS]
@@ -193,21 +231,32 @@ def should_skip(msg: email.message.Message, exec_email_addr: str) -> Optional[st
     if not sender:
         return "no sender"
     if DENY_SENDER_PATTERNS.search(sender):
-        return f"deny sender pattern: {sender}"
+        return f"deny sender pattern: {_scrub(sender)}"
     if sender == exec_email_addr.lower():
         return "loop: from self"
+
+    # Loop-protection: our own outbound carries an X-Exec-Mail header.
+    # If we ever see it inbound, another exec-email instance / replay is
+    # bouncing it back to us. Hard stop.
+    if msg.get(EXEC_MAIL_HEADER):
+        return f"loop: {EXEC_MAIL_HEADER} header present"
 
     subject = (msg.get("Subject") or "").strip().lower()
     for pfx in DENY_SUBJECT_PREFIXES:
         if subject.startswith(pfx):
             return f"deny subject prefix: {pfx}"
 
+    # RFC 3834: only "no" (or absent) is a real human message.
     auto_submitted = (msg.get("Auto-Submitted") or "").strip().lower()
-    if auto_submitted and auto_submitted != "no":
-        return f"auto-submitted: {auto_submitted}"
+    # Header is structured ("auto-replied; ..."), so split on ';' / spaces
+    # and look at the leading token.
+    if auto_submitted:
+        primary = re.split(r"[\s;]+", auto_submitted, maxsplit=1)[0]
+        if primary != ALLOWED_AUTO_SUBMITTED:
+            return f"auto-submitted: {primary}"
 
     precedence = (msg.get("Precedence") or "").strip().lower()
-    if precedence in ("bulk", "list", "junk", "auto_reply"):
+    if precedence in DENY_PRECEDENCE:
         return f"precedence: {precedence}"
     return None
 
@@ -216,22 +265,35 @@ def should_skip(msg: email.message.Message, exec_email_addr: str) -> Optional[st
 async def init_db() -> None:
     global db_pool
     db_pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=4)
-    sql_path = os.path.join(os.path.dirname(__file__), "migrations", "001_init.sql")
-    if os.path.exists(sql_path):
-        with open(sql_path, "r", encoding="utf-8") as f:
-            sql = f.read()
-        async with db_pool.acquire() as conn:
-            await conn.execute(sql)
+    migrations_dir = os.path.join(os.path.dirname(__file__), "migrations")
+    if os.path.isdir(migrations_dir):
+        for fname in sorted(os.listdir(migrations_dir)):
+            if not fname.endswith(".sql"):
+                continue
+            sql_path = os.path.join(migrations_dir, fname)
+            with open(sql_path, "r", encoding="utf-8") as f:
+                sql = f.read()
+            async with db_pool.acquire() as conn:
+                await conn.execute(sql)
+            logger.info(f"[db] applied migration {fname}")
     logger.info("[db] connected, schema applied")
 
 
 async def load_thread(role: str, thread_id: str) -> dict:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT message_count, prior_messages, handed_off FROM exec_email_threads "
-            "WHERE role=$1 AND thread_id=$2",
-            role, thread_id,
-        )
+    # M7: degrade-OK without DB — return empty thread state so the
+    # service can still reply (just without history).
+    if db_pool is None:
+        return {"message_count": 0, "prior_messages": [], "handed_off": False}
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT message_count, prior_messages, handed_off FROM exec_email_threads "
+                "WHERE role=$1 AND thread_id=$2",
+                role, thread_id,
+            )
+    except Exception as e:
+        logger.warning(f"[{role}] load_thread DB error — degrading: {e!r}")
+        return {"message_count": 0, "prior_messages": [], "handed_off": False}
     if not row:
         return {"message_count": 0, "prior_messages": [], "handed_off": False}
     pm = row["prior_messages"]
@@ -241,26 +303,141 @@ async def load_thread(role: str, thread_id: str) -> dict:
 
 
 async def save_thread(role: str, thread_id: str, message_id: str, prior_messages: list, handed_off: bool) -> None:
+    # M7: silently no-op if DB is down — caller can't persist, but the
+    # reply already went out and the IMAP loop should not crash.
+    if db_pool is None:
+        return None
     # Cap prior_messages to last 20 entries (10 turns) for sanity.
     pm = prior_messages[-20:]
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO exec_email_threads (thread_id, role, last_seen_at, last_message_id, message_count, prior_messages, handed_off)
-            VALUES ($1, $2, now(), $3, 1, $4::jsonb, $5)
-            ON CONFLICT (role, thread_id) DO UPDATE
-              SET last_seen_at = now(),
-                  last_message_id = EXCLUDED.last_message_id,
-                  message_count = exec_email_threads.message_count + 1,
-                  prior_messages = EXCLUDED.prior_messages,
-                  handed_off = exec_email_threads.handed_off OR EXCLUDED.handed_off
-            """,
-            thread_id, role, message_id, json.dumps(pm), handed_off,
-        )
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO exec_email_threads (thread_id, role, last_seen_at, last_message_id, message_count, prior_messages, handed_off)
+                VALUES ($1, $2, now(), $3, 1, $4::jsonb, $5)
+                ON CONFLICT (role, thread_id) DO UPDATE
+                  SET last_seen_at = now(),
+                      last_message_id = EXCLUDED.last_message_id,
+                      message_count = exec_email_threads.message_count + 1,
+                      prior_messages = EXCLUDED.prior_messages,
+                      handed_off = exec_email_threads.handed_off OR EXCLUDED.handed_off
+                """,
+                thread_id, role, message_id, json.dumps(pm), handed_off,
+            )
+    except Exception as e:
+        logger.warning(f"[{role}] save_thread DB error — degrading: {e!r}")
+
+
+# ───── rate limits (H1) ──────────────────────────────────────────────────
+# Sentinel return values from rate-limit checks.
+RATE_OK = "ok"
+RATE_FAIL_CLOSED = "fail_closed"   # DB outage — drop + mark seen + notify
+RATE_BLOCKED_SENDER = "sender_capped"
+RATE_BLOCKED_ROLE = "role_capped"
+
+
+async def check_and_bump_rate(role: str, sender_email: str) -> tuple:
+    """Atomically increment the (role, sender, hour) bucket and check
+    both per-sender-hour and per-role-day caps.
+
+    Returns (status, sender_count, role_24h_total).
+
+    M7: if the DB is unreachable we FAIL CLOSED — public mailbox without
+    rate limiting is a DoS amplifier. The caller drops the message and
+    notifies Wade.
+    """
+    if db_pool is None:
+        return (RATE_FAIL_CLOSED, 0, 0)
+    sender = (sender_email or "").lower()
+    try:
+        async with db_pool.acquire() as conn:
+            # Upsert this hour's bucket and read back the new count.
+            sender_count = await conn.fetchval(
+                """
+                INSERT INTO exec_email_rate (role, sender_email, bucket_hour, count)
+                VALUES ($1, $2, date_trunc('hour', now() AT TIME ZONE 'UTC'), 1)
+                ON CONFLICT (role, sender_email, bucket_hour) DO UPDATE
+                  SET count = exec_email_rate.count + 1
+                RETURNING count
+                """,
+                role, sender,
+            )
+            # Per-role 24h hard cap (sum across all senders, all hours).
+            role_24h = await conn.fetchval(
+                """
+                SELECT COALESCE(SUM(count), 0)::int
+                FROM exec_email_rate
+                WHERE role = $1
+                  AND bucket_hour >= date_trunc('hour', (now() AT TIME ZONE 'UTC') - interval '23 hours')
+                """,
+                role,
+            )
+    except Exception as e:
+        logger.warning(f"[{role}] rate-limit DB error — failing closed: {e!r}")
+        return (RATE_FAIL_CLOSED, 0, 0)
+
+    state[role]["rate_today"] = int(role_24h or 0)
+    state[role]["rate_this_hour_total"] = int(sender_count or 0)
+
+    if role_24h and role_24h > MAX_PER_ROLE_PER_DAY:
+        state[role]["rate_capped_today"] = True
+        return (RATE_BLOCKED_ROLE, int(sender_count or 0), int(role_24h or 0))
+    if sender_count and sender_count > MAX_PER_SENDER_PER_HOUR:
+        return (RATE_BLOCKED_SENDER, int(sender_count or 0), int(role_24h or 0))
+    return (RATE_OK, int(sender_count or 0), int(role_24h or 0))
+
+
+def _notify_once(key: str) -> bool:
+    """Return True if this dedup key has not yet fired today."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    full = f"{key}:{today}"
+    if full in _notified_keys:
+        return False
+    _notified_keys.add(full)
+    return True
 
 
 # ───── Crew API ──────────────────────────────────────────────────────────
+TRANSIENT_STATUS = {500, 502, 503, 504}
+
+
+async def _crew_call_once(role: str, payload: dict) -> tuple:
+    """Single attempt. Returns (status, body_str_or_response).
+
+    status:
+      - 200 + response body → ("ok", "<reply text>")
+      - transient (5xx / timeout / connector error) → ("transient", "<reason>")
+      - permanent (4xx, parse error, etc.) → ("permanent", "<reason>")
+    """
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{ASPEN_ADMIN_URL}/api/crew/permanent/{role}/message",
+                json=payload,
+                headers={"X-Admin-Key": ADMIN_API_KEY, "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=210),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return ("ok", (data.get("response") or "").strip())
+                txt = await resp.text()
+                if resp.status in TRANSIENT_STATUS:
+                    return ("transient", f"http {resp.status}: {_scrub(txt)}")
+                return ("permanent", f"http {resp.status}: {_scrub(txt)}")
+    except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as e:
+        return ("transient", f"{type(e).__name__}: {_scrub(str(e))}")
+    except aiohttp.ClientError as e:
+        # Other aiohttp client errors (most are connection-ish) → transient
+        return ("transient", f"{type(e).__name__}: {_scrub(str(e))}")
+    except Exception as e:
+        return ("permanent", f"{type(e).__name__}: {_scrub(str(e))}")
+
+
 async def ask_crew(role: str, body: str, conversation_id: str, prior_messages: list) -> Optional[str]:
+    """Call Aspen Crew, with one retry on transient failures (5xx /
+    timeout / connector). Does NOT retry on 4xx. Prevents notify-storms
+    while Aspen restarts.
+    """
     if not ADMIN_API_KEY:
         logger.error("ADMIN_API_KEY not set — cannot call Crew")
         return None
@@ -271,26 +448,22 @@ async def ask_crew(role: str, body: str, conversation_id: str, prior_messages: l
         "max_turns": 5,
         "timeout_seconds": 180,
     }
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                f"{ASPEN_ADMIN_URL}/api/crew/permanent/{role}/message",
-                json=payload,
-                headers={"X-Admin-Key": ADMIN_API_KEY, "Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=210),
-            ) as resp:
-                if resp.status != 200:
-                    txt = await resp.text()
-                    logger.error(f"[{role}] crew api {resp.status}: {txt[:300]}")
-                    return None
-                data = await resp.json()
-                return (data.get("response") or "").strip() or None
-    except asyncio.TimeoutError:
-        logger.error(f"[{role}] crew api timeout")
+
+    status, info = await _crew_call_once(role, payload)
+    if status == "ok":
+        return info or None
+    if status == "permanent":
+        logger.error(f"[{role}] crew api permanent error (no retry): {info}")
         return None
-    except Exception as e:
-        logger.error(f"[{role}] crew api error: {e}")
-        return None
+
+    # transient — wait then retry once
+    logger.warning(f"[{role}] crew api transient ({info}) — retrying in 5s")
+    await asyncio.sleep(5)
+    status2, info2 = await _crew_call_once(role, payload)
+    if status2 == "ok":
+        return info2 or None
+    logger.error(f"[{role}] crew api failed after retry: {info2}")
+    return None
 
 
 # ───── SMTP ──────────────────────────────────────────────────────────────
@@ -303,7 +476,20 @@ async def send_smtp(exec_cfg: dict, to_addr: str, subject: str, body_text: str,
     bcc = WADE_BCC_EMAIL
     if bcc and parseaddr(to_addr)[1].lower() != bcc.lower():
         msg["Bcc"] = bcc
-    msg["Subject"] = subject
+
+    # Subject: ensure "[Exec-Mail]" tag is present for loop-protection.
+    # Place it AFTER any "Re:" so threading still reads naturally.
+    s = (subject or "").strip()
+    low = s.lower()
+    tag_low = EXEC_MAIL_SUBJECT_TAG.lower()
+    if tag_low not in low:
+        if low.startswith("re:"):
+            # "Re: foo" → "Re: [Exec-Mail] foo"
+            s = "Re: " + EXEC_MAIL_SUBJECT_TAG + " " + s[3:].lstrip()
+        else:
+            s = EXEC_MAIL_SUBJECT_TAG + " " + s
+    msg["Subject"] = s
+
     new_msg_id = email.utils.make_msgid(domain=DOMAIN)
     msg["Message-ID"] = new_msg_id
     msg["Date"] = email.utils.formatdate(localtime=True)
@@ -313,6 +499,14 @@ async def send_smtp(exec_cfg: dict, to_addr: str, subject: str, body_text: str,
         msg["References"] = references
     elif in_reply_to:
         msg["References"] = in_reply_to
+
+    # Loop-protection headers (RFC 3834 + our own marker). Well-behaved
+    # auto-responders (vacation, ticketing systems) will not reply to a
+    # message marked Auto-Submitted / Precedence: bulk.
+    msg["Auto-Submitted"] = "auto-replied"
+    msg["Precedence"] = "bulk"
+    msg[EXEC_MAIL_HEADER] = "1"
+
     msg.set_content(body_text + signature(exec_cfg["name"], exec_cfg["title"]))
 
     password = os.environ.get(f"EXEC_EMAIL_{exec_cfg['key']}_PASSWORD", "")
@@ -334,8 +528,13 @@ async def notify_wade(exec_cfg: dict, subject: str, note: str) -> None:
         msg = EmailMessage()
         msg["From"] = f"{exec_cfg['name']} <{exec_cfg['local']}@{DOMAIN}>"
         msg["To"] = WADE_BCC_EMAIL
-        msg["Subject"] = f"[exec-email/{exec_cfg['role']}] {subject}"
+        # Tag subject so a reply from Wade hits should_skip's
+        # [Exec-Mail] denylist (no accidental ping-pong).
+        msg["Subject"] = f"{EXEC_MAIL_SUBJECT_TAG} [{exec_cfg['role']}] {subject}"
         msg["Date"] = email.utils.formatdate(localtime=True)
+        msg["Auto-Submitted"] = "auto-generated"
+        msg["Precedence"] = "bulk"
+        msg[EXEC_MAIL_HEADER] = "1"
         msg.set_content(note)
         password = os.environ.get(f"EXEC_EMAIL_{exec_cfg['key']}_PASSWORD", "")
         await aiosmtplib.send(
@@ -344,30 +543,95 @@ async def notify_wade(exec_cfg: dict, subject: str, note: str) -> None:
             use_tls=True, timeout=60,
         )
     except Exception as e:
-        logger.error(f"[{exec_cfg['role']}] notify_wade failed: {e}")
+        logger.error(f"[{exec_cfg['role']}] notify_wade failed: {_scrub(str(e))}")
 
 
 # ───── message processing ───────────────────────────────────────────────
-async def process_message(exec_cfg: dict, raw_bytes: bytes) -> None:
+# process_message return values — used by scan_unseen (H4) to decide
+# whether to mark the message \Seen.
+#   "ok"           — handled (replied, handed off, etc.) → mark \Seen
+#   "skip-seen"    — intentionally skipped (denylist, rate limit, empty
+#                    body, already-handed-off thread, etc.) → mark \Seen
+#   "skip-unseen"  — leave UNSEEN, will retry next pass (DB fail-closed,
+#                    transient drop, anything we could not safely \Seen)
+PROC_OK = "ok"
+PROC_SKIP_SEEN = "skip-seen"
+PROC_SKIP_UNSEEN = "skip-unseen"
+
+
+async def process_message(exec_cfg: dict, raw_bytes: bytes) -> str:
     role = exec_cfg["role"]
     exec_addr = f"{exec_cfg['local']}@{DOMAIN}"
     try:
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
     except Exception as e:
-        logger.error(f"[{role}] parse error: {e}")
-        return
+        # Parse failure: leave UNSEEN so we don't silently drop it,
+        # and notify Wade so it can be diagnosed.
+        logger.error(f"[{role}] parse error: {_scrub(str(e))}")
+        await notify_wade(exec_cfg, "parse error",
+                          f"Failed to parse inbound message: {_scrub(str(e))}")
+        return PROC_SKIP_UNSEEN
 
     skip_reason = should_skip(msg, exec_addr)
     if skip_reason:
         logger.info(f"[{role}] skip: {skip_reason}")
-        return
+        # Intentional skip — mark \Seen so we don't re-evaluate next pass.
+        return PROC_SKIP_SEEN
 
     sender_addr = parseaddr(msg.get("From", ""))[1]
     subject = (msg.get("Subject") or "(no subject)").strip()
     body = extract_text_body(msg)
     if not body:
-        logger.info(f"[{role}] skip: empty body from {sender_addr}")
-        return
+        logger.info(f"[{role}] skip: empty body from {_scrub(sender_addr)}")
+        return PROC_SKIP_SEEN
+
+    # H1: per-sender hourly + per-role daily rate limit. Atomic upsert
+    # in DB. If DB is down, FAIL CLOSED — public mailbox without rate
+    # limiting is a DoS amplifier.
+    rate_status, sender_count, role_24h = await check_and_bump_rate(role, sender_addr)
+    if rate_status == RATE_FAIL_CLOSED:
+        logger.warning(
+            f"[{role}] rate-limit DB unavailable — failing closed, "
+            f"dropping inbound from {_scrub(sender_addr)}"
+        )
+        if _notify_once(f"db-rate-down:{role}"):
+            await notify_wade(
+                exec_cfg, "rate-limit DB down — failing closed",
+                f"Could not check rate limits (DB unreachable). Dropping "
+                f"inbound from {_scrub(sender_addr)} subject "
+                f"'{_scrub(subject)}' to avoid unbounded auto-reply. "
+                f"Will keep failing closed until DB recovers."
+            )
+        return PROC_SKIP_SEEN
+    if rate_status == RATE_BLOCKED_ROLE:
+        logger.warning(
+            f"[{role}] role-day cap hit ({role_24h}/{MAX_PER_ROLE_PER_DAY}) — "
+            f"dropping inbound from {_scrub(sender_addr)}"
+        )
+        if _notify_once(f"role-cap:{role}"):
+            await notify_wade(
+                exec_cfg, "daily role cap reached",
+                f"Role '{role}' hit MAX_PER_ROLE_PER_DAY="
+                f"{MAX_PER_ROLE_PER_DAY} (24h count={role_24h}). "
+                f"All further inbound to this role will be dropped "
+                f"(silently \\Seen) until the rolling window relaxes."
+            )
+        return PROC_SKIP_SEEN
+    if rate_status == RATE_BLOCKED_SENDER:
+        logger.warning(
+            f"[{role}] sender-hour cap ({sender_count}>"
+            f"{MAX_PER_SENDER_PER_HOUR}) — dropping from {_scrub(sender_addr)}"
+        )
+        if _notify_once(f"sender-cap:{role}:{(sender_addr or '').lower()}"):
+            await notify_wade(
+                exec_cfg, "sender hourly cap tripped",
+                f"Sender {_scrub(sender_addr)} exceeded "
+                f"MAX_PER_SENDER_PER_HOUR={MAX_PER_SENDER_PER_HOUR} "
+                f"to role '{role}'. Further messages from this sender "
+                f"this hour are silently dropped. (One notify per "
+                f"sender per day.)"
+            )
+        return PROC_SKIP_SEEN
 
     msg_id = (msg.get("Message-ID") or "").strip()
     root_id = thread_root_id(msg)
@@ -379,7 +643,7 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> None:
     # Hard cap: hand off after MAX_THREAD_TURNS replies
     if thread["handed_off"]:
         logger.info(f"[{role}] thread {root_id} already handed off — ignoring")
-        return
+        return PROC_SKIP_SEEN
     if thread["message_count"] >= MAX_THREAD_TURNS:
         handoff_text = (
             f"Thanks for the follow-up. I've passed this thread to Wade for human "
@@ -389,15 +653,17 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> None:
             reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
             await send_smtp(exec_cfg, sender_addr, reply_subject, handoff_text,
                             in_reply_to=msg_id or None, references=new_refs or None)
-            await notify_wade(exec_cfg, f"thread handoff to you",
-                              f"Thread '{subject}' from {sender_addr} hit MAX_THREAD_TURNS={MAX_THREAD_TURNS}.\n"
-                              f"Last inbound message:\n\n{body[:1000]}")
+            await notify_wade(exec_cfg, "thread handoff to you",
+                              f"Thread '{_scrub(subject)}' from {_scrub(sender_addr)} "
+                              f"hit MAX_THREAD_TURNS={MAX_THREAD_TURNS}.\n"
+                              f"Last inbound message:\n\n{_scrub(body)}")
             await save_thread(role, root_id, msg_id, thread["prior_messages"], handed_off=True)
             bump_messages_today(role)
             logger.info(f"[{role}] handed off thread {root_id} to Wade")
+            return PROC_OK
         except Exception as e:
-            logger.error(f"[{role}] handoff send failed: {e}")
-        return
+            logger.error(f"[{role}] handoff send failed: {_scrub(str(e))}")
+            return PROC_SKIP_UNSEEN
 
     # Build prior_messages with the new inbound appended.
     prior = list(thread["prior_messages"])
@@ -409,29 +675,34 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> None:
         # Better silence than a wrong reply — notify Wade.
         await notify_wade(
             exec_cfg, "crew error — no reply sent",
-            f"Inbound email from {sender_addr}, subject '{subject}', failed Crew call.\n\n"
-            f"Body:\n{body[:2000]}"
+            f"Inbound email from {_scrub(sender_addr)}, subject "
+            f"'{_scrub(subject)}', failed Crew call.\n\nBody:\n{_scrub(body)}"
         )
         state[role]["last_error"] = f"crew error at {now_iso()}"
-        return
+        # Crew error already retried once inside ask_crew. Mark \Seen so
+        # we don't loop on the same input — Wade has the heads-up.
+        return PROC_SKIP_SEEN
 
     reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     try:
         await send_smtp(exec_cfg, sender_addr, reply_subject, reply,
                         in_reply_to=msg_id or None, references=new_refs or None)
     except Exception as e:
-        logger.error(f"[{role}] SMTP send failed: {e}")
-        state[role]["last_error"] = f"smtp error: {e}"
+        logger.error(f"[{role}] SMTP send failed: {_scrub(str(e))}")
+        state[role]["last_error"] = f"smtp error: {_scrub(str(e))}"
         await notify_wade(exec_cfg, "SMTP send failed",
-                          f"To: {sender_addr}\nSubject: {subject}\nError: {e}\n\nReply was:\n{reply}")
-        return
+                          f"To: {_scrub(sender_addr)}\nSubject: {_scrub(subject)}\n"
+                          f"Error: {_scrub(str(e))}\n\nReply was:\n{_scrub(reply)}")
+        # SMTP transient — leave UNSEEN so next pass retries.
+        return PROC_SKIP_UNSEEN
 
     prior.append({"role": "user", "content": crew_input})
     prior.append({"role": "assistant", "content": reply})
     await save_thread(role, root_id, msg_id, prior, handed_off=False)
     bump_messages_today(role)
-    logger.info(f"[{role}] replied to {sender_addr} (thread={root_id}, "
+    logger.info(f"[{role}] replied to {_scrub(sender_addr)} (thread={root_id}, "
                 f"turn={thread['message_count']+1}/{MAX_THREAD_TURNS})")
+    return PROC_OK
 
 
 # ───── IMAP loop ─────────────────────────────────────────────────────────
@@ -448,6 +719,8 @@ async def imap_loop(exec_cfg: dict) -> None:
 
     backoff = 5
     while True:
+        client = None
+        idle_task = None
         try:
             ssl_ctx = ssl.create_default_context()
             client = aioimaplib.IMAP4_SSL(host=IMAP_HOST, port=IMAP_PORT, ssl_context=ssl_ctx, timeout=60)
@@ -477,18 +750,29 @@ async def imap_loop(exec_cfg: dict) -> None:
                     await asyncio.wait_for(idle_task, timeout=10)
                 except asyncio.TimeoutError:
                     pass
+                idle_task = None  # consumed cleanly
 
                 # Check for new messages
                 await scan_unseen(client, exec_cfg)
 
         except Exception as e:
             state[role]["imap_connected"] = False
-            state[role]["last_error"] = f"imap loop: {e}"
-            logger.error(f"[{role}] IMAP loop error: {e!r} — reconnect in {backoff}s")
-            try:
-                await client.logout()
-            except Exception:
-                pass
+            state[role]["last_error"] = f"imap loop: {_scrub(str(e))}"
+            logger.error(f"[{role}] IMAP loop error: {_scrub(repr(e))} — reconnect in {backoff}s")
+            # M9: explicitly cancel the in-flight IDLE task so it doesn't
+            # leak as an orphan task on every reconnect.
+            if idle_task is not None and not idle_task.done():
+                idle_task.cancel()
+                try:
+                    await idle_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            idle_task = None
+            if client is not None:
+                try:
+                    await client.logout()
+                except Exception:
+                    pass
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 300)
 
@@ -522,17 +806,38 @@ async def scan_unseen(client: "aioimaplib.IMAP4_SSL", exec_cfg: dict) -> None:
                     break
             if raw is None:
                 continue
+
+            # H4: ONLY mark \Seen on success or intentional skip. On a
+            # transient failure (parse crash, SMTP retryable, etc.)
+            # leave UNSEEN so we get another shot. Notify Wade so silent
+            # drops can't happen.
+            result = PROC_SKIP_UNSEEN
             try:
-                await process_message(exec_cfg, raw)
+                result = await process_message(exec_cfg, raw)
             except Exception as e:
-                logger.error(f"[{role}] process_message error: {e!r}")
-            # Mark as seen so we don't reprocess on reconnect.
-            try:
-                await client.store(uid, "+FLAGS", "(\\Seen)")
-            except Exception:
-                pass
+                logger.error(f"[{role}] process_message uncaught error: {_scrub(repr(e))}")
+                try:
+                    await notify_wade(exec_cfg, "process_message uncaught exception",
+                                      f"UID {uid} hit uncaught exception: "
+                                      f"{_scrub(repr(e))}\nLeaving UNSEEN.")
+                except Exception:
+                    pass
+                result = PROC_SKIP_UNSEEN
+
+            if result in (PROC_OK, PROC_SKIP_SEEN):
+                try:
+                    await client.store(uid, "+FLAGS", "(\\Seen)")
+                except Exception as flag_err:
+                    logger.warning(
+                        f"[{role}] could not set \\Seen on UID {uid}: "
+                        f"{_scrub(repr(flag_err))}"
+                    )
+            else:
+                logger.info(
+                    f"[{role}] UID {uid} left UNSEEN — will retry next pass"
+                )
     except Exception as e:
-        logger.error(f"[{role}] scan_unseen error: {e!r}")
+        logger.error(f"[{role}] scan_unseen error: {_scrub(repr(e))}")
 
 
 # ───── HTTP heartbeat ────────────────────────────────────────────────────
@@ -550,10 +855,19 @@ async def healthz(_request: web.Request) -> web.Response:
             "last_message_at": s["last_message_at"],
             "messages_today": s["messages_today"],
             "last_error": s["last_error"],
+            # H1: per-exec rate counters surfaced for MC.
+            "rate_today": s.get("rate_today", 0),
+            "rate_this_hour_total": s.get("rate_this_hour_total", 0),
+            "rate_capped_today": s.get("rate_capped_today", False),
         })
     payload = {
         "service": "exec-email",
         "now": now_iso(),
+        "limits": {
+            "max_per_sender_per_hour": MAX_PER_SENDER_PER_HOUR,
+            "max_per_role_per_day": MAX_PER_ROLE_PER_DAY,
+            "max_thread_turns": MAX_THREAD_TURNS,
+        },
         "execs": out,
     }
     return web.json_response(payload)
@@ -578,6 +892,7 @@ async def main() -> None:
     logger.info(f"Aspen Admin URL: {ASPEN_ADMIN_URL}")
     logger.info(f"BCC Wade at: {WADE_BCC_EMAIL}")
     logger.info(f"MAX_THREAD_TURNS={MAX_THREAD_TURNS}, POLL_INTERVAL_FALLBACK={POLL_INTERVAL_FALLBACK}s")
+    logger.info(f"Rate caps: per-sender/hour={MAX_PER_SENDER_PER_HOUR}, per-role/day={MAX_PER_ROLE_PER_DAY}")
 
     try:
         await init_db()
