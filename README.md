@@ -25,14 +25,39 @@ skipped (same pattern as `exec-telegram`).
 
 ## Safety rails
 
+The exec addresses are listed publicly on https://wade.technology, so
+inbound traffic is fully untrusted. The following defences run before
+any LLM call or SMTP send:
+
+- **Per-sender hourly cap** (`MAX_PER_SENDER_PER_HOUR`, default 5) and
+  **per-role 24h hard cap** (`MAX_PER_ROLE_PER_DAY`, default 50). Excess
+  inbound is silently `\Seen`-marked. Wade is notified at most once per
+  sender per day and once per role per day. Backed by the
+  `exec_email_rate` ledger; if the DB is unreachable the service
+  **fails closed** (no replies) rather than auto-allow.
+- **Reply-loop hardening:** every outbound message carries
+  `Auto-Submitted: auto-replied`, `Precedence: bulk`, `X-Exec-Mail: 1`,
+  and an `[Exec-Mail]` subject prefix. Inbound is rejected if any of
+  those signals come back at us (RFC 3834-aware).
 - Bounce / no-reply / postmaster senders are dropped.
-- Subjects beginning with `Re: [Exec-Mail]`, `Auto:`, `Automatic reply:`,
-  `Out of office:` are dropped (loop protection).
-- `Auto-Submitted` / `Precedence: bulk|list|junk` are dropped.
+- Subjects beginning with `[Exec-Mail]`, `Re: [Exec-Mail]`, `Auto:`,
+  `Automatic reply:`, `Out of office:` are dropped.
+- `Auto-Submitted != no` / `Precedence in {bulk,list,junk,auto_reply}`
+  are dropped.
 - A thread caps at `MAX_THREAD_TURNS` (default 3) replies, then sends a
   one-shot "passed to Wade" reply and notifies Wade separately.
-- On any Crew error we send Wade a heads-up and **do not** auto-reply.
+- **Crew API retry:** one retry after 5s on 5xx / timeout / connector
+  errors; no retry on 4xx — prevents notify-storms during Aspen
+  restarts.
+- **`\Seen` ordering:** messages are only marked Seen after successful
+  processing or an intentional skip (denylist / rate-limit). Parse
+  crashes leave the message UNSEEN and notify Wade so silent drops
+  cannot happen.
+- On any Crew error after retry we send Wade a heads-up and **do not**
+  auto-reply.
 - Outbound signature includes AI disclosure.
+- Bodies in logs / heads-up notifies are capped at 200 chars and email
+  addresses are redacted (`<email>`).
 
 ## Heartbeat
 
@@ -42,10 +67,17 @@ skipped (same pattern as `exec-telegram`).
 {
   "service": "exec-email",
   "now": "...",
+  "limits": {
+    "max_per_sender_per_hour": 5,
+    "max_per_role_per_day": 50,
+    "max_thread_turns": 3
+  },
   "execs": [
     {"role": "ceo", "address": "victor@wade.technology",
      "configured": true, "imap_connected": true,
-     "last_message_at": "...", "messages_today": 0, "last_error": null}, ...
+     "last_message_at": "...", "messages_today": 0, "last_error": null,
+     "rate_today": 3, "rate_this_hour_total": 1,
+     "rate_capped_today": false}, ...
   ]
 }
 ```
@@ -79,8 +111,10 @@ Key vars:
 | `IMAP_HOST` / `SMTP_HOST` | `imap.migadu.com` / `smtp.migadu.com` |
 | `EXEC_EMAIL_{KEY}_PASSWORD` | One per exec; missing => skipped |
 | `MAX_THREAD_TURNS` | Hard cap before handoff (default 3) |
+| `MAX_PER_SENDER_PER_HOUR` | Per-sender hourly cap (default 5) — excess silently dropped |
+| `MAX_PER_ROLE_PER_DAY` | Per-role 24h hard cap (default 50) — DoS amp prevention |
 | `POLL_INTERVAL_FALLBACK` | Seconds between IDLE keepalives (default 30) |
-| `DB_*` | Reuses the wtec Postgres for thread state |
+| `DB_*` | Reuses the wtec Postgres for thread state + rate-limit ledger |
 
 ## Deploy
 
