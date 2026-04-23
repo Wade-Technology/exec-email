@@ -90,3 +90,16 @@ verify container Up, hit `/healthz`). Manual force-deploy:
 `./deploy-wade-tech.sh exec-email` from the docker repo.
 
 Hetzner pull path: `/opt/exec-email/`.
+
+## Bring-up checklist
+
+1. From the docker repo: `ssh root@hetzner '/opt/exec-email/scripts/provision-exec-mailboxes.sh --dry-run'` — verify it lists 8 mailboxes to create.
+2. Drop `--dry-run` to actually provision — passwords are written only to `/opt/wtec/.env`, never to stdout.
+3. Push this repo to `main` (or run `./deploy-wade-tech.sh exec-email`) — CI brings the container up and curl-verifies `/healthz`.
+4. Confirm at `http://178.156.206.0:8085/healthz` (or via Mission Control) that all 8 execs show `configured: true, imap_connected: true`.
+
+## Mission Control hookup
+
+MC's exec-email status panel polls `http://exec-email:8080/healthz` over the
+`wtec_default` Docker network. The same endpoint is exposed at
+`127.0.0.1:8085/healthz` on the host for ad-hoc inspection.
