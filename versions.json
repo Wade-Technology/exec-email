@@ -1,7 +1,7 @@
 {
   "exec-email": {
-    "version": "1.1.1",
+    "version": "1.2.0",
     "updated": "2026-04-21",
-    "description": "Port 587 + STARTTLS (465 blocked by Hetzner egress firewall); docker-compose now uses shared wade-network"
+    "description": "Unified logging: double-log inbound + outbound to Nesta `conversations` table (fire-and-forget) so MC /communications shows Exec Team traffic alongside Nesta mail"
   }
 }
