@@ -3,9 +3,9 @@ services:
     build: .
     container_name: exec-email
     restart: unless-stopped
-    # Join the wtec network so we can reach aspen-admin-backend and the shared postgres
+    # Join the shared wade-network so we can reach aspen-admin-backend and the shared postgres
     networks:
-      - wtec_default
+      - wade-network
     ports:
       - "127.0.0.1:8085:8080"   # /healthz exposed locally for MC poller
     environment:
@@ -15,7 +15,7 @@ services:
       - IMAP_HOST=${IMAP_HOST:-imap.migadu.com}
       - IMAP_PORT=${IMAP_PORT:-993}
       - SMTP_HOST=${SMTP_HOST:-smtp.migadu.com}
-      - SMTP_PORT=${SMTP_PORT:-465}
+      - SMTP_PORT=${SMTP_PORT:-587}
       - POLL_INTERVAL_FALLBACK=${POLL_INTERVAL_FALLBACK:-30}
       - MAX_THREAD_TURNS=${MAX_THREAD_TURNS:-3}
       - MAX_PER_SENDER_PER_HOUR=${MAX_PER_SENDER_PER_HOUR:-5}
@@ -35,5 +35,5 @@ services:
       - EXEC_EMAIL_HIGGINSDEV_PASSWORD=${EXEC_EMAIL_HIGGINSDEV_PASSWORD:-}
 
 networks:
-  wtec_default:
+  wade-network:
     external: true

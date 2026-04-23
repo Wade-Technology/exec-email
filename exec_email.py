@@ -516,7 +516,7 @@ async def send_smtp(exec_cfg: dict, to_addr: str, subject: str, body_text: str,
         port=SMTP_PORT,
         username=f"{exec_cfg['local']}@{DOMAIN}",
         password=password,
-        use_tls=True,
+        start_tls=True,
         timeout=60,
     )
     return new_msg_id
@@ -540,7 +540,7 @@ async def notify_wade(exec_cfg: dict, subject: str, note: str) -> None:
         await aiosmtplib.send(
             msg, hostname=SMTP_HOST, port=SMTP_PORT,
             username=f"{exec_cfg['local']}@{DOMAIN}", password=password,
-            use_tls=True, timeout=60,
+            start_tls=True, timeout=60,
         )
     except Exception as e:
         logger.error(f"[{exec_cfg['role']}] notify_wade failed: {_scrub(str(e))}")
