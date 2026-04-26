@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import signal
-import ssl
+import socket
 import uuid
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -31,10 +31,11 @@ from email.utils import getaddresses, parseaddr
 from typing import Optional
 
 import aiohttp
-import aioimaplib
 import aiosmtplib
 import asyncpg
 from aiohttp import web
+from imap_tools import AND, MailBox, MailMessageFlags
+from imap_tools.errors import MailboxLoginError
 
 # ───── config ────────────────────────────────────────────────────────────
 ASPEN_ADMIN_URL = os.environ.get("ASPEN_ADMIN_URL", "http://aspen-admin-backend:8001")
@@ -990,6 +991,51 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> str:
 
 
 # ───── IMAP loop ─────────────────────────────────────────────────────────
+# Replaced aioimaplib (login() hangs against Migadu) with imap-tools (sync,
+# stdlib-imaplib-backed, well-tested). We poll instead of IDLE — for 8
+# mailboxes with low traffic, polling every POLL_INTERVAL_FALLBACK seconds
+# is plenty and removes a giant pile of Future/await/IDLE-state failure
+# modes. Each exec runs its blocking IMAP work inside asyncio.to_thread()
+# so the asyncio reactor (Crew calls, SMTP, DB) keeps moving.
+def _fetch_unseen_blocking(user: str, password: str) -> list:
+    """Synchronously connect → login → INBOX → fetch UNSEEN as raw bytes
+    → logout. Returns a list of (uid: str, raw_bytes: bytes). Marks
+    nothing seen — the caller flags after process_message() succeeds.
+
+    Any failure raises; the caller logs + backs off.
+    """
+    out: list = []
+    # 30s socket timeout matches stdlib imaplib's behaviour against Migadu.
+    with MailBox(IMAP_HOST, IMAP_PORT, timeout=30).login(
+        user, password, initial_folder="INBOX"
+    ) as mb:
+        # mark_seen=False — we only set \Seen after process_message
+        # confirms success or an intentional skip (PROC_OK / PROC_SKIP_SEEN).
+        for msg in mb.fetch(AND(seen=False), mark_seen=False, bulk=False):
+            uid = str(msg.uid) if msg.uid is not None else ""
+            if not uid:
+                continue
+            raw = bytes(msg.obj.as_bytes()) if msg.obj else b""
+            if not raw or len(raw) < 50:
+                continue
+            out.append((uid, raw))
+    return out
+
+
+def _flag_seen_blocking(user: str, password: str, uids: list) -> None:
+    """Open a fresh IMAP connection, mark the given UIDs as \\Seen,
+    logout. Used after async process_message has settled. Doing this in
+    a separate connection from the fetch keeps the fetch's MailBox
+    context tight (no long-held connection while we're waiting on Aspen
+    Crew + SMTP for ~30-180s)."""
+    if not uids:
+        return
+    with MailBox(IMAP_HOST, IMAP_PORT, timeout=30).login(
+        user, password, initial_folder="INBOX"
+    ) as mb:
+        mb.flag(uids, MailMessageFlags.SEEN, True)
+
+
 async def imap_loop(exec_cfg: dict) -> None:
     role = exec_cfg["role"]
     key = exec_cfg["key"]
@@ -1002,126 +1048,99 @@ async def imap_loop(exec_cfg: dict) -> None:
     user = f"{exec_cfg['local']}@{DOMAIN}"
 
     backoff = 5
+    # Track whether we've already logged the steady-state "connected" line
+    # for this run, so we don't spam logs every poll cycle. Reset on every
+    # reconnect (after an exception).
+    announced_connected = False
+
     while True:
-        client = None
-        idle_task = None
         try:
-            ssl_ctx = ssl.create_default_context()
-            client = aioimaplib.IMAP4_SSL(host=IMAP_HOST, port=IMAP_PORT, ssl_context=ssl_ctx, timeout=60)
-            await client.wait_hello_from_server()
-            await client.login(user, password)
-            await client.select("INBOX")
-            state[role]["imap_connected"] = True
-            state[role]["last_error"] = None
-            logger.info(f"[{role}] IMAP connected as {user}")
-            backoff = 5
+            # Pull this poll's UNSEEN batch off the IMAP server.
+            try:
+                batch = await asyncio.to_thread(
+                    _fetch_unseen_blocking, user, password
+                )
+            except MailboxLoginError as e:
+                # Login auth failure — almost always password drift between
+                # /opt/exec-email/.env and Migadu. Bubble up to outer
+                # except so we back off and notify.
+                raise
+            except (socket.timeout, OSError, asyncio.TimeoutError) as e:
+                # Network blip — log + back off via outer except.
+                raise
+            except Exception:
+                raise
 
-            # On startup, scan UNSEEN messages once (catches anything received while we were down)
-            await scan_unseen(client, exec_cfg)
+            if not announced_connected:
+                state[role]["imap_connected"] = True
+                state[role]["last_error"] = None
+                logger.info(f"[{role}] IMAP connected as {user} (imap-tools polling every {POLL_INTERVAL_FALLBACK}s)")
+                announced_connected = True
+                backoff = 5
 
-            while True:
-                if client.has_pending_idle():
-                    await client.idle_done()
+            if batch:
+                logger.info(f"[{role}] fetched {len(batch)} UNSEEN")
 
-                idle_task = await client.idle_start(timeout=600)  # ~10 min keepalive
-                # Wait for either an event or fallback poll interval
+            # Process each message; collect UIDs to flag \Seen after.
+            seen_uids: list = []
+            for uid, raw in batch:
+                # H4: only mark \Seen on success or intentional skip. A
+                # transient failure (parse crash, SMTP retryable, etc.)
+                # leaves UNSEEN so we get another shot. Notify Wade so
+                # silent drops can't happen.
+                result = PROC_SKIP_UNSEEN
                 try:
-                    await asyncio.wait_for(client.wait_server_push(), timeout=POLL_INTERVAL_FALLBACK)
-                except asyncio.TimeoutError:
-                    pass
-                client.idle_done()
+                    result = await process_message(exec_cfg, raw)
+                except Exception as e:
+                    logger.error(f"[{role}] process_message uncaught error: {_scrub(repr(e))}")
+                    try:
+                        await notify_wade(
+                            exec_cfg,
+                            "process_message uncaught exception",
+                            f"UID {uid} hit uncaught exception: "
+                            f"{_scrub(repr(e))}\nLeaving UNSEEN.",
+                        )
+                    except Exception:
+                        pass
+                    result = PROC_SKIP_UNSEEN
+
+                if result in (PROC_OK, PROC_SKIP_SEEN):
+                    seen_uids.append(uid)
+                else:
+                    logger.info(
+                        f"[{role}] UID {uid} left UNSEEN — will retry next pass"
+                    )
+
+            # Flag everything we successfully handled in one batch.
+            if seen_uids:
                 try:
-                    await asyncio.wait_for(idle_task, timeout=10)
-                except asyncio.TimeoutError:
-                    pass
-                idle_task = None  # consumed cleanly
+                    await asyncio.to_thread(
+                        _flag_seen_blocking, user, password, seen_uids
+                    )
+                except Exception as flag_err:
+                    logger.warning(
+                        f"[{role}] could not set \\Seen on {len(seen_uids)} UIDs: "
+                        f"{_scrub(repr(flag_err))}"
+                    )
 
-                # Check for new messages
-                await scan_unseen(client, exec_cfg)
+            # Sleep until next poll. Cancellation (shutdown) propagates
+            # through normally as CancelledError.
+            await asyncio.sleep(POLL_INTERVAL_FALLBACK)
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             state[role]["imap_connected"] = False
             state[role]["last_error"] = f"imap loop: {_scrub(str(e))}"
-            logger.error(f"[{role}] IMAP loop error: {_scrub(repr(e))} — reconnect in {backoff}s")
-            # M9: explicitly cancel the in-flight IDLE task so it doesn't
-            # leak as an orphan task on every reconnect.
-            if idle_task is not None and not idle_task.done():
-                idle_task.cancel()
-                try:
-                    await idle_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            idle_task = None
-            if client is not None:
-                try:
-                    await client.logout()
-                except Exception:
-                    pass
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 300)
-
-
-async def scan_unseen(client: "aioimaplib.IMAP4_SSL", exec_cfg: dict) -> None:
-    role = exec_cfg["role"]
-    try:
-        typ, data = await client.search("UNSEEN")
-        if typ != "OK" or not data:
-            return
-        # data[0] is bytes like b"1 2 3"
-        ids_blob = data[0]
-        if isinstance(ids_blob, (bytes, bytearray)):
-            ids = ids_blob.split()
-        else:
-            ids = str(ids_blob).split()
-        if not ids:
-            return
-        for uid_b in ids:
-            uid = uid_b.decode() if isinstance(uid_b, (bytes, bytearray)) else str(uid_b)
-            if not uid.strip():
-                continue
-            typ, msg_data = await client.fetch(uid, "(RFC822)")
-            if typ != "OK" or not msg_data:
-                continue
-            # msg_data is a list; find the bytes blob
-            raw = None
-            for item in msg_data:
-                if isinstance(item, (bytes, bytearray)) and len(item) > 100:
-                    raw = bytes(item)
-                    break
-            if raw is None:
-                continue
-
-            # H4: ONLY mark \Seen on success or intentional skip. On a
-            # transient failure (parse crash, SMTP retryable, etc.)
-            # leave UNSEEN so we get another shot. Notify Wade so silent
-            # drops can't happen.
-            result = PROC_SKIP_UNSEEN
+            announced_connected = False
+            logger.error(
+                f"[{role}] IMAP loop error: {_scrub(repr(e))} — reconnect in {backoff}s"
+            )
             try:
-                result = await process_message(exec_cfg, raw)
-            except Exception as e:
-                logger.error(f"[{role}] process_message uncaught error: {_scrub(repr(e))}")
-                try:
-                    await notify_wade(exec_cfg, "process_message uncaught exception",
-                                      f"UID {uid} hit uncaught exception: "
-                                      f"{_scrub(repr(e))}\nLeaving UNSEEN.")
-                except Exception:
-                    pass
-                result = PROC_SKIP_UNSEEN
-
-            if result in (PROC_OK, PROC_SKIP_SEEN):
-                try:
-                    await client.store(uid, "+FLAGS", "(\\Seen)")
-                except Exception as flag_err:
-                    logger.warning(
-                        f"[{role}] could not set \\Seen on UID {uid}: "
-                        f"{_scrub(repr(flag_err))}"
-                    )
-            else:
-                logger.info(
-                    f"[{role}] UID {uid} left UNSEEN — will retry next pass"
-                )
-    except Exception as e:
-        logger.error(f"[{role}] scan_unseen error: {_scrub(repr(e))}")
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2, 300)
 
 
 # ───── HTTP heartbeat ────────────────────────────────────────────────────
