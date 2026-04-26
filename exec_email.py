@@ -997,6 +997,12 @@ async def process_message(exec_cfg: dict, raw_bytes: bytes) -> str:
 # is plenty and removes a giant pile of Future/await/IDLE-state failure
 # modes. Each exec runs its blocking IMAP work inside asyncio.to_thread()
 # so the asyncio reactor (Crew calls, SMTP, DB) keeps moving.
+#
+# Connection-per-cycle pattern: ONE login per poll, fetch UNSEEN raw bytes,
+# logout. Process messages async (Crew + SMTP + DB) outside the IMAP
+# context. Then ONE more login at end of cycle to flag \Seen. Migadu
+# rate-limits concurrent logins per account, so we keep each login
+# short-lived and stagger the 8 execs at startup.
 def _fetch_unseen_blocking(user: str, password: str) -> list:
     """Synchronously connect → login → INBOX → fetch UNSEEN as raw bytes
     → logout. Returns a list of (uid: str, raw_bytes: bytes). Marks
@@ -1036,7 +1042,7 @@ def _flag_seen_blocking(user: str, password: str, uids: list) -> None:
         mb.flag(uids, MailMessageFlags.SEEN, True)
 
 
-async def imap_loop(exec_cfg: dict) -> None:
+async def imap_loop(exec_cfg: dict, startup_delay: float = 0.0) -> None:
     role = exec_cfg["role"]
     key = exec_cfg["key"]
     password = os.environ.get(f"EXEC_EMAIL_{key}_PASSWORD", "").strip()
@@ -1046,6 +1052,16 @@ async def imap_loop(exec_cfg: dict) -> None:
 
     state[role]["configured"] = True
     user = f"{exec_cfg['local']}@{DOMAIN}"
+
+    # Stagger initial login so 8 execs don't simultaneously hammer
+    # Migadu and trigger "too many errors" temp-bans. Each exec waits
+    # its proportional slot of POLL_INTERVAL_FALLBACK, so by steady
+    # state the 8 polls are evenly spread across each interval.
+    if startup_delay > 0:
+        try:
+            await asyncio.sleep(startup_delay)
+        except asyncio.CancelledError:
+            raise
 
     backoff = 5
     # Track whether we've already logged the steady-state "connected" line
@@ -1061,9 +1077,9 @@ async def imap_loop(exec_cfg: dict) -> None:
                     _fetch_unseen_blocking, user, password
                 )
             except MailboxLoginError as e:
-                # Login auth failure — almost always password drift between
-                # /opt/exec-email/.env and Migadu. Bubble up to outer
-                # except so we back off and notify.
+                # Login auth failure — could be password drift OR Migadu
+                # temp-banning us for too many concurrent logins. Bubble
+                # up to outer except so we back off.
                 raise
             except (socket.timeout, OSError, asyncio.TimeoutError) as e:
                 # Network blip — log + back off via outer except.
@@ -1133,8 +1149,11 @@ async def imap_loop(exec_cfg: dict) -> None:
             state[role]["imap_connected"] = False
             state[role]["last_error"] = f"imap loop: {_scrub(str(e))}"
             announced_connected = False
+            # MailboxLoginError prints with empty repr; surface its class
+            # name so Wade can tell auth-fail from network blip in logs.
+            err_str = _scrub(repr(e)) or type(e).__name__
             logger.error(
-                f"[{role}] IMAP loop error: {_scrub(repr(e))} — reconnect in {backoff}s"
+                f"[{role}] IMAP loop error: {err_str} — reconnect in {backoff}s"
             )
             try:
                 await asyncio.sleep(backoff)
@@ -1219,13 +1238,33 @@ async def main() -> None:
 
     runner = await start_http()
 
-    # One IMAP task per configured exec.
+    # One IMAP task per configured exec. Stagger startup so 8 simultaneous
+    # logins don't trip Migadu's "too many errors" rate limit. Each exec
+    # gets its proportional slice of POLL_INTERVAL_FALLBACK as initial
+    # delay, so by the second poll cycle they're evenly spread.
+    configured = [
+        c for c in EXECS
+        if os.environ.get(f"EXEC_EMAIL_{c['key']}_PASSWORD", "").strip()
+    ]
+    n = max(len(configured), 1)
     tasks = []
     for cfg in EXECS:
-        if os.environ.get(f"EXEC_EMAIL_{cfg['key']}_PASSWORD", "").strip():
-            tasks.append(asyncio.create_task(imap_loop(cfg), name=f"imap-{cfg['role']}"))
-        else:
+        if not os.environ.get(f"EXEC_EMAIL_{cfg['key']}_PASSWORD", "").strip():
             logger.info(f"[{cfg['role']}] EXEC_EMAIL_{cfg['key']}_PASSWORD not set — skipping IMAP task")
+            continue
+        # Index inside `configured` (stable, deterministic) determines the
+        # initial offset. exec at index i waits (i / n) * poll seconds.
+        try:
+            idx = configured.index(cfg)
+        except ValueError:
+            idx = 0
+        delay = (idx / n) * POLL_INTERVAL_FALLBACK
+        tasks.append(
+            asyncio.create_task(
+                imap_loop(cfg, startup_delay=delay),
+                name=f"imap-{cfg['role']}",
+            )
+        )
 
     if not tasks:
         logger.warning("No exec mailboxes configured — heartbeat only.")
