@@ -1,4 +1,8 @@
-aioimaplib==1.0.1
+# IMAP: imap-tools (sync) replaces aioimaplib (broken — login() hangs vs Migadu).
+# Sync is fine here; we run each exec's poll loop in asyncio.to_thread() so the
+# rest of the service (Crew calls, SMTP, DB) stays async. Polling beats IDLE for
+# 8 mailboxes — fewer moving parts, no Future/await brittleness.
+imap-tools==1.6.0
 aiosmtplib==3.0.2
 aiohttp==3.9.5
 asyncpg==0.29.0

@@ -1,11 +1,17 @@
 # exec-email
 
 Gives each Wade.Technology AI executive a working public mailbox at
-`@wade.technology`. The service holds an IMAP IDLE connection to Migadu
-for each exec, routes inbound messages through the Aspen Crew
-`permanent-message` API as that exec's persona, and replies via SMTPS
-threaded into the original conversation. Wade is BCC'd on every outbound
-message.
+`@wade.technology`. The service polls each exec's Migadu inbox over IMAP
+(via `imap-tools`), routes inbound messages through the Aspen Crew
+`permanent-message` API as that exec's persona, and replies via SMTP
+STARTTLS threaded into the original conversation. Wade is BCC'd on every
+outbound message.
+
+> The previous async stack (`aioimaplib` + IDLE) was replaced in v1.3.0
+> after `aioimaplib.login()` started hanging against Migadu and putting
+> all 8 IMAP loops into an `Abort('command SELECT illegal in state
+> NONAUTH')` reconnect storm. Polling every `POLL_INTERVAL_FALLBACK`
+> seconds (default 30s) is fine for the exec-mail volume we see.
 
 ## Execs (all `@wade.technology`)
 
