@@ -1,0 +1,21 @@
+name: Check
+on:
+  pull_request:
+    branches: [main, master]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax check
+        run: |
+          find . -name '*.py' \
+            -not -path './.venv/*' \
+            -not -path './venv/*' \
+            -not -path './.git/*' \
+            -not -path './node_modules/*' \
+            -print0 | xargs -0 -r -n50 python -m py_compile
+          echo "check workflow completed (syntax)"
